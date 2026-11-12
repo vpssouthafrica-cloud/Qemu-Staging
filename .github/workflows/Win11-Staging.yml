@@ -58,6 +58,8 @@ jobs:
   win11:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -87,10 +89,8 @@ jobs:
           ls /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_VARS_4M.fd
 
       - name: Setup Tailscale
-        if: ${{ secrets.TAILSCALE_AUTHKEY != '' }}
+        if: ${{ env.TAILSCALE_AUTHKEY != '' }}
         continue-on-error: true
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           set -e
           curl -fsSL https://tailscale.com/install.sh | sudo sh >/dev/null 2>&1
