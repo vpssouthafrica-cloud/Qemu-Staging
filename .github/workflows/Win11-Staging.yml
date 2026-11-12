@@ -410,6 +410,20 @@ jobs:
           done
           echo "Keep-alive finished."
 
+      - name: Upload boot diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-diag
+          path: |
+            /tmp/win11-qemu.log
+            /tmp/win11.ppm
+            /tmp/swtpm.log
+            /tmp/vps_tunnel.log
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Checkpoint and upload state
         if: ${{ always() && !cancelled() }}
         continue-on-error: true
