@@ -1,0 +1,518 @@
+name: Windows 11 Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      vm_name:
+        description: "VM name"
+        required: true
+        default: "win11test"
+        type: string
+      action:
+        description: "auto | provision | boot"
+        required: true
+        default: "auto"
+        type: choice
+        options: [auto, provision, boot]
+      source_url:
+        description: "Checkpoint source (release:state-win11test) - optional"
+        required: false
+        default: ""
+        type: string
+      runtime:
+        description: "Minutes to keep the VM alive (max 300)"
+        required: true
+        default: "300"
+        type: string
+      vnc_password:
+        description: "VNC password"
+        required: true
+        default: "runner"
+        type: string
+  schedule:
+    - cron: "47 */6 * * *"
+
+concurrency:
+  group: win11-${{ github.event.inputs.vm_name || 'win11' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  VM: ${{ github.event.inputs.vm_name || 'win11' }}
+  ACTION: ${{ github.event.inputs.action || 'auto' }}
+  SOURCE_URL: ${{ github.event.inputs.source_url || '' }}
+  RUNTIME: ${{ github.event.inputs.runtime || '300' }}
+  VNC_PASSWORD: ${{ github.event.inputs.vnc_password || 'runner' }}
+  TAG: state-${{ github.event.inputs.vm_name || 'win11test' }}
+  WIN11_ISO_URL: "https://computernewb.com/isos/windows/en-us_windows_11_iot_enterprise_ltsc_2024_x64_dvd_f6b14814.iso"
+  WIN11_ISO_SIZE: "5144817664"
+  VPS_TUNNEL_HOST: "129.151.173.224"
+  RDP_PORT: "3390"
+  VNC_PORT: "5902"
+  DISK_GB: "64"
+
+jobs:
+  win11:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm \
+            /usr/local/lib/node_modules /opt/az 2>/dev/null || true
+          sudo docker system prune -af --volumes >/dev/null 2>&1 || true
+          sudo apt-get clean || true
+          df -h / /mnt | tail -2
+
+      - name: Install tools
+        run: |
+          sudo sh -c 'echo "http://mirrors.edge.kernel.org/ubuntu/" > /etc/apt/apt-mirrors.txt' 2>/dev/null || true
+          sudo sed -i -E 's|https?://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu/?|http://mirrors.edge.kernel.org/ubuntu/|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          sudo timeout 240 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 \
+            -o Acquire::Retries=3 update -qq || \
+            sudo timeout 240 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get -o Acquire::ForceIPv4=true \
+            -o Acquire::http::Timeout=20 -o Acquire::Retries=3 install -y -qq \
+            qemu-system-x86 qemu-utils ovmf swtpm genisoimage xorriso p7zip-full dosfstools mtools \
+            zstd curl wget jq netcat-openbsd aria2 tar >/dev/null
+          qemu-system-x86_64 --version | head -n1
+          swtpm --version | head -n1
+          ls /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_VARS_4M.fd
+
+      - name: Setup Tailscale
+        if: ${{ secrets.TAILSCALE_AUTHKEY != '' }}
+        continue-on-error: true
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -e
+          curl -fsSL https://tailscale.com/install.sh | sudo sh >/dev/null 2>&1
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" \
+            --hostname "vortax-${{ env.VM }}" \
+            --accept-routes --accept-dns=false --timeout 90s
+          TS_IP=$(sudo tailscale ip -4 | head -n1)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $TS_IP"
+
+      - name: Resolve mode
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          HAVE=no
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
+                 | grep -qE "^${VM}-[0-9]{8}-[0-9]{4}\.(7z\.001|qcow2\.zst\.001)"; then
+              HAVE=yes
+            fi
+          fi
+          if [ "$ACTION" = "boot" ] && [ "$HAVE" != "yes" ]; then
+            echo "::error title=No checkpoint::action=boot but release $TAG has no disk checkpoint."
+            exit 1
+          fi
+          if [ "$ACTION" = "provision" ]; then NEED=yes
+          elif [ "$HAVE" = "yes" ]; then NEED=no
+          else NEED=yes; fi
+          echo "NEED_PROVISION=$NEED" >> $GITHUB_ENV
+          echo "Checkpoint present: $HAVE ; provision: $NEED"
+
+      - name: Restore checkpoint
+        if: ${{ env.NEED_PROVISION != 'yes' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          sudo mkdir -p /mnt/dl
+          sudo chown "$(id -u):$(id -g)" /mnt/dl
+          cd /mnt/dl
+          echo "Restoring $TAG ..."
+          gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
+            | xargs -P 6 -I{} gh release download "$TAG" --repo "${{ github.repository }}" --clobber -p "{}"
+          ZFIRST=$(ls -1 "${VM}"-*.qcow2.zst.001 2>/dev/null | head -n1 || true)
+          if [ -n "$ZFIRST" ]; then
+            cat "${VM}"-*.qcow2.zst.* | sudo zstd -d -T0 -q -o "/mnt/${VM}.qcow2"
+            OV=$(ls -1 "${VM}"-*.OVMF_VARS.fd.zst 2>/dev/null | head -n1 || true)
+            if [ -n "$OV" ]; then sudo zstd -d -q -f "$OV" -o /mnt/OVMF_VARS.fd; fi
+            SW=$(ls -1 "${VM}"-*.swtpm-state.tar.zst 2>/dev/null | head -n1 || true)
+            if [ -n "$SW" ]; then sudo zstd -d -q -f "$SW" -o /mnt/swtpm-state.tar; fi
+          else
+            FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
+            if [ -n "$FIRST" ]; then sudo 7z x -y "$FIRST" -o/mnt >/dev/null; fi
+          fi
+          if [ ! -f "/mnt/${VM}.qcow2" ]; then
+            QC=$(sudo find /mnt -maxdepth 4 -name "${VM}.qcow2" 2>/dev/null | head -n1)
+            if [ -n "$QC" ]; then sudo mv "$QC" "/mnt/${VM}.qcow2"; fi
+          fi
+          if [ ! -f "/mnt/${VM}.qcow2" ]; then
+            echo "::error::Could not restore ${VM}.qcow2 from $TAG"
+            exit 1
+          fi
+          sudo qemu-img resize "/mnt/${VM}.qcow2" "${DISK_GB}G" >/dev/null 2>&1 || true
+          echo "Restored /mnt/${VM}.qcow2"
+          sudo ls -lh /mnt/OVMF_VARS.fd /mnt/swtpm-state.tar 2>/dev/null || true
+
+      - name: Provision Windows 11 (unattended install to disk)
+        if: ${{ env.NEED_PROVISION == 'yes' }}
+        timeout-minutes: 100
+        run: |
+          set -e
+          echo "Downloading Windows 11 ISO..."
+          sudo mkdir -p /mnt/dl
+          sudo chown "$(id -u):$(id -g)" /mnt/dl
+          aria2c -x 8 -s 8 -k 1M -q --allow-overwrite=true \
+            -d /mnt/dl -o win11.iso "$WIN11_ISO_URL"
+          ISO_BYTES=$(stat -c%s /mnt/dl/win11.iso)
+          echo "ISO bytes: $ISO_BYTES (expected $WIN11_ISO_SIZE)"
+          if [ "$ISO_BYTES" != "$WIN11_ISO_SIZE" ]; then
+            echo "::error::ISO size mismatch - download incomplete or changed."
+            exit 1
+          fi
+          mkdir -p /tmp/unattend
+          cp .github/win11/Autounattend.xml /tmp/unattend/Autounattend.xml
+          sudo mv /mnt/dl/win11.iso /mnt/win11.iso
+          sudo chmod 644 /mnt/win11.iso
+
+          echo "Building unattended answer ISO and USB stick..."
+          genisoimage -quiet -o /tmp/unattend.iso -J -R -V UNATTEND /tmp/unattend
+          sudo mv /tmp/unattend.iso /mnt/unattend.iso
+          sudo chmod 644 /mnt/unattend.iso
+          dd if=/dev/zero of=/tmp/answer.img bs=1M count=32 status=none
+          mkfs.vfat -F 32 -n ANSWER /tmp/answer.img >/dev/null
+          mcopy -i /tmp/answer.img /tmp/unattend/Autounattend.xml ::/Autounattend.xml
+          mdir -i /tmp/answer.img ::/ | tail -3
+          sudo mv /tmp/answer.img /mnt/answer.img
+          sudo chmod 644 /mnt/answer.img
+
+          echo "Creating ${DISK_GB}G qcow2 disk..."
+          sudo rm -f "/mnt/${VM}.qcow2"
+          sudo qemu-img create -f qcow2 "/mnt/${VM}.qcow2" "${DISK_GB}G" >/dev/null
+          sudo cp /usr/share/OVMF/OVMF_VARS_4M.fd /mnt/OVMF_VARS.fd
+          sudo chown "$(id -u):$(id -g)" /mnt/OVMF_VARS.fd
+          sudo chmod 644 /mnt/OVMF_VARS.fd
+          df -h /mnt | tail -1
+
+      - name: Expose RDP and VNC via public reverse tunnel
+        if: always()
+        continue-on-error: true
+        env:
+          VPS_TUNNEL_KEY: ${{ secrets.VPS_TUNNEL_KEY }}
+        run: |
+          set +e
+          if [ -z "$VPS_TUNNEL_KEY" ]; then
+            echo "::warning title=Public access skipped::VPS_TUNNEL_KEY secret not set"
+            exit 0
+          fi
+          printf '%s\n' "$VPS_TUNNEL_KEY" > /tmp/vps_tunnel
+          chmod 600 /tmp/vps_tunnel
+          cat > /tmp/vps_tunnel_loop.sh <<EOF
+          #!/bin/bash
+          while true; do
+            ssh -N -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
+              -o ExitOnForwardFailure=yes -i /tmp/vps_tunnel \
+              -R 0.0.0.0:${RDP_PORT}:localhost:${RDP_PORT} \
+              -R 0.0.0.0:${VNC_PORT}:localhost:5900 \
+              opc@${VPS_TUNNEL_HOST}
+            sleep 5
+          done
+          EOF
+          chmod +x /tmp/vps_tunnel_loop.sh
+          nohup /tmp/vps_tunnel_loop.sh > /tmp/vps_tunnel.log 2>&1 &
+          sleep 10
+          BANNER=$(timeout 8 bash -c "exec 3<>/dev/tcp/$VPS_TUNNEL_HOST/${VNC_PORT} && head -c 12 <&3" 2>/dev/null)
+          if [ -n "$BANNER" ]; then
+            echo "Public VNC reachable: $VPS_TUNNEL_HOST:${VNC_PORT}"
+            echo "RDP tunneled on: $VPS_TUNNEL_HOST:${RDP_PORT}"
+          else
+            echo "::warning title=Public access::Tunnel started but VNC self-test failed; see /tmp/vps_tunnel.log"
+            tail -5 /tmp/vps_tunnel.log 2>/dev/null || true
+          fi
+
+      - name: Prepare TPM
+        run: |
+          set -e
+          rm -rf /tmp/swtpm
+          mkdir -p /tmp/swtpm
+          if [ -f /mnt/swtpm-state.tar ]; then
+            echo "Restoring TPM state from checkpoint..."
+            tar -C /tmp/swtpm -xf /mnt/swtpm-state.tar
+          fi
+          SWTPM_ARGS=(socket --tpm2 --tpmstate dir=/tmp/swtpm \
+            --ctrl type=unixio,path=/tmp/swtpm.sock --flags not-need-init --daemon)
+          swtpm "${SWTPM_ARGS[@]}" 2>/tmp/swtpm.log || \
+            sudo swtpm "${SWTPM_ARGS[@]}" 2>>/tmp/swtpm.log
+          for i in $(seq 1 20); do [ -S /tmp/swtpm.sock ] && break; sleep 1; done
+          ls -l /tmp/swtpm.sock
+
+      - name: Start Windows 11 and wait for RDP
+        env:
+          NEED: ${{ env.NEED_PROVISION }}
+        run: |
+          set -e
+          test -f "/mnt/${VM}.qcow2"
+          OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+          cat > /tmp/win11-start.sh <<'EOS'
+          #!/bin/bash
+          set -e
+          MODE="$1"
+          DISK="$2"
+          ARGS=(-enable-kvm -cpu host -smp 4,sockets=1,cores=4,threads=1 -m 12G -machine q35
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd
+            -drive if=pflash,format=raw,file=/mnt/OVMF_VARS.fd
+            -chardev socket,id=chrtpm,path=/tmp/swtpm.sock
+            -tpmdev emulator,id=tpm0,chardev=chrtpm
+            -device tpm-tis,tpmdev=tpm0
+            -drive file="$DISK",if=none,id=disk0,format=qcow2
+            -device ide-hd,drive=disk0,bus=ide.0
+            -vnc :0,password=on -monitor tcp:localhost:4444,server,nowait
+            -display none
+            -vga std -device qemu-xhci -device usb-tablet -device usb-kbd
+            -audiodev none,id=snd0 -device ich9-intel-hda -device hda-duplex,audiodev=snd0
+            -netdev user,id=n0,hostfwd=tcp::3389-:3389
+            -device e1000,netdev=n0
+            -rtc base=localtime)
+          if [ "$MODE" = "provision" ]; then
+            ARGS+=(-drive file=/mnt/win11.iso,if=none,id=cd0,media=cdrom,readonly=on
+              -device ide-cd,drive=cd0,bus=ide.1
+              -drive file=/mnt/unattend.iso,if=none,id=cd1,media=cdrom,readonly=on
+              -device ide-cd,drive=cd1,bus=ide.2
+              -drive if=none,id=ans,file=/mnt/answer.img,format=raw,readonly=on
+              -device usb-storage,drive=ans
+              -boot order=c,once=d)
+          else
+            ARGS+=(-boot order=c)
+          fi
+          exec qemu-system-x86_64 "${ARGS[@]}"
+          EOS
+          chmod +x /tmp/win11-start.sh
+          echo "Starting QEMU (${NEED} mode)..."
+          ( sudo /tmp/win11-start.sh "$( [ "$NEED" = yes ] && echo provision || echo boot )" \
+              "/mnt/${VM}.qcow2" > /tmp/win11-qemu.log 2>&1 & )
+          for i in $(seq 1 40); do
+            pgrep -f qemu-system-x86_64 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pgrep -f qemu-system-x86_64 >/dev/null 2>&1 || { echo "::error::QEMU failed to start"; tail -40 /tmp/win11-qemu.log; exit 1; }
+          for i in $(seq 1 30); do
+            if echo "change vnc password ${VNC_PASSWORD}" | nc -q 1 localhost 4444 >/dev/null 2>&1; then
+              echo "VNC password set"; break
+            fi
+            sleep 2
+          done
+          if [ "$NEED" = "yes" ]; then
+            echo "Sending boot keypresses (Press any key to boot from CD)..."
+            for i in $(seq 1 12); do
+              echo "sendkey spc" | nc -q 1 localhost 4444 >/dev/null 2>&1 || true
+              sleep 1
+            done
+          fi
+
+          rdp_up() {
+          python3 - <<'PY'
+          import socket, sys
+          try:
+              s = socket.create_connection(("127.0.0.1", 3389), timeout=3)
+              s.settimeout(3)
+              s.sendall(bytes.fromhex("030000130ee000000000000100080003000000"))
+              d = s.recv(16)
+              sys.exit(0 if d[:2] == b"\x03\x00" else 1)
+          except Exception:
+              sys.exit(1)
+          PY
+          }
+
+          if [ "$NEED" = "yes" ]; then BUDGET=3600; else BUDGET=1200; fi
+          echo "Waiting up to $((BUDGET / 60)) min for Windows to answer RDP..."
+          READY=no
+          i=0
+          while [ $i -lt $BUDGET ]; do
+            if ! pgrep -f qemu-system-x86_64 >/dev/null 2>&1; then
+              echo "::error::QEMU exited; see /tmp/win11-qemu.log"
+              tail -40 /tmp/win11-qemu.log 2>/dev/null || true
+              exit 1
+            fi
+            if rdp_up; then READY=yes; break; fi
+            sleep 10
+            i=$((i + 10))
+            if [ $((i % 120)) -eq 0 ]; then
+              echo "screendump /tmp/win11.ppm" | nc -q 1 localhost 4444 >/dev/null 2>&1 || true
+              sleep 1
+              if [ -s /tmp/win11.ppm ]; then
+                echo "still waiting ($i s) - screen captured at /tmp/win11.ppm"
+              fi
+            fi
+          done
+          echo "RDP answering: $READY"
+          if [ "$READY" = "yes" ]; then
+            echo "screendump /tmp/win11.ppm" | nc -q 1 localhost 4444 >/dev/null 2>&1 || true
+            sudo touch /mnt/${VM}-ready
+          else
+            echo "::warning title=Windows not ready::No RDP response; this run will not be checkpointed or looped. Inspect VNC."
+          fi
+
+      - name: Connection info
+        run: |
+          TSIP="${TAILSCALE_IP}"
+          SELF=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//')
+          [ -z "$SELF" ] && SELF="vortax-${{ env.VM }}"
+          [ -z "$TSIP" ] && TSIP=$(sudo tailscale ip -4 2>/dev/null | head -n1)
+          {
+            echo "Program: Windows 11 IoT Enterprise LTSC 2024"
+            echo "Tailscale node: $SELF"
+            echo "Tailscale IP: $TSIP"
+            echo "RDP (public): ${VPS_TUNNEL_HOST}:${RDP_PORT}  user runner  password runner"
+            echo "RDP (tailscale): $TSIP:${RDP_PORT}  user runner  password runner"
+            echo "VNC (public): ${VPS_TUNNEL_HOST}:${VNC_PORT}  password ${{ env.VNC_PASSWORD }}"
+            echo "VNC (tailscale): $TSIP:5900  password ${{ env.VNC_PASSWORD }}"
+            echo "Audio: RDP > Local Resources > Remote audio > Play on this computer"
+            echo "Outbound downloads: direct via runner (not through the VPS)"
+          } > connection.txt
+          {
+            echo "### Windows 11 IoT Enterprise LTSC 2024"
+            echo "- **RDP (stable):** \`${VPS_TUNNEL_HOST}:${RDP_PORT}\` — user \`runner\` / password \`runner\`"
+            echo "- **RDP (Tailscale):** \`$TSIP:${RDP_PORT}\`"
+            echo "- **VNC (stable):** \`${VPS_TUNNEL_HOST}:${VNC_PORT}\` — password \`${{ env.VNC_PASSWORD }}\`"
+            echo "- **Audio:** RDP client → Local Resources → Remote audio → *Play on this computer*"
+            echo "- **Downloads:** direct via the runner (not through the Oracle box)"
+          } >> $GITHUB_STEP_SUMMARY
+          cat connection.txt
+
+      - name: Upload connection info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connection
+          path: connection.txt
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Keep alive
+        run: |
+          RUNTIME="${{ env.RUNTIME }}"
+          if [ "$RUNTIME" -gt 300 ]; then RUNTIME=300; fi
+          echo "VM is up for ${RUNTIME} minutes (tunnel supervised)."
+          i=0
+          while [ "$i" -lt "$RUNTIME" ]; do
+            if [ -x /tmp/vps_tunnel_loop.sh ] && ! pgrep -f vps_tunnel_loop.sh >/dev/null 2>&1; then
+              echo "$(date -u +%H:%M:%S) tunnel died - restarting"
+              nohup /tmp/vps_tunnel_loop.sh > /tmp/vps_tunnel.log 2>&1 &
+              sleep 5
+            fi
+            sleep 60
+            i=$((i + 1))
+          done
+          echo "Keep-alive finished."
+
+      - name: Checkpoint and upload state
+        if: ${{ always() && !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Requesting ACPI shutdown of Windows..."
+          echo "system_powerdown" | nc -q 1 localhost 4444 >/dev/null 2>&1 || true
+          for i in $(seq 1 180); do
+            pgrep -f qemu-system-x86_64 >/dev/null 2>&1 || break
+            sleep 1
+          done
+          sudo pkill -9 -f qemu-system-x86_64 || true
+          sleep 2
+          if [ ! -f "/mnt/${VM}-ready" ]; then
+            echo "::warning title=Not checkpointing::Windows never answered RDP, so this disk is not uploaded."
+            exit 0
+          fi
+          if [ ! -f "/mnt/${VM}.qcow2" ]; then
+            echo "::warning::No disk to upload"; exit 0
+          fi
+          pkill -f "swtpm socket" 2>/dev/null || sudo pkill -f "swtpm socket" || true
+          sleep 2
+          if [ -d /tmp/swtpm ]; then
+            tar -C /tmp/swtpm -cf /mnt/swtpm-state.tar . 2>/dev/null || sudo tar -C /tmp/swtpm -cf /mnt/swtpm-state.tar .
+          fi
+          echo "Compacting the disk image..."
+          sudo qemu-img convert -O qcow2 "/mnt/${VM}.qcow2" "/mnt/${VM}-compact.qcow2" || true
+          if [ -f "/mnt/${VM}-compact.qcow2" ]; then
+            sudo mv "/mnt/${VM}-compact.qcow2" "/mnt/${VM}.qcow2"
+          fi
+          DATE=$(date -u +%Y%m%d-%H%M)
+          sudo rm -f "/mnt/${VM}-"[0-9]*.7z* "/mnt/${VM}-"[0-9]*.qcow2.zst* \
+            "/mnt/${VM}-"[0-9]*.OVMF_VARS.fd.zst "/mnt/${VM}-"[0-9]*.swtpm-state.tar.zst
+          echo "Compressing with zstd in 1800 MB volumes..."
+          sudo zstd -T0 -3 -q -f "/mnt/${VM}.qcow2" -o "/mnt/${VM}-${DATE}.qcow2.zst"
+          sudo split -b 1800M -d -a 3 "/mnt/${VM}-${DATE}.qcow2.zst" "/mnt/${VM}-${DATE}.qcow2.zst."
+          sudo rm -f "/mnt/${VM}-${DATE}.qcow2.zst"
+          if [ -f /mnt/OVMF_VARS.fd ]; then
+            sudo zstd -T0 -3 -q -f /mnt/OVMF_VARS.fd -o "/mnt/${VM}-${DATE}.OVMF_VARS.fd.zst"
+          fi
+          if [ -f /mnt/swtpm-state.tar ]; then
+            sudo zstd -T0 -3 -q -f /mnt/swtpm-state.tar -o "/mnt/${VM}-${DATE}.swtpm-state.tar.zst"
+          fi
+          sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}".* 2>/dev/null || true
+          ls -lh /mnt/"${VM}-${DATE}".* | awk '{print $9, $5}'
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "${{ github.repository }}" \
+              --title "Vortax state: ${VM}" \
+              --notes "Rolling Windows 11 disk checkpoints for ${VM}. Newest timestamp is current state."
+          ls -1 /mnt/"${VM}-${DATE}".* | xargs -P 4 -I{} gh release upload "$TAG" "{}" --repo "${{ github.repository }}" --clobber
+          PARTS=$(ls -1 /mnt/"${VM}-${DATE}".* | wc -l)
+          UPLOADED=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' | grep -c "^${VM}-${DATE}\." || true)
+          if [ "$PARTS" -gt 0 ] && [ "$UPLOADED" -eq "$PARTS" ]; then
+            echo "State saved under $TAG ($DATE, $PARTS assets)."
+            echo "DOWNLOAD_LINK=release:${TAG}" >> $GITHUB_ENV
+            echo "release:${TAG}" > disk_link.txt
+            gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
+              | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\.(7z|qcow2\.zst\.|OVMF_VARS\.fd\.zst|swtpm-state\.tar\.zst)" \
+              | grep -v "^${VM}-${DATE}\." \
+              | while read -r a; do gh release delete-asset "$TAG" "$a" --repo "${{ github.repository }}" -y >/dev/null 2>&1 || true; done
+          else
+            echo "::warning title=State upload failed::Checkpoint assets ${UPLOADED}/${PARTS} present."
+          fi
+          sudo rm -f /mnt/"${VM}-${DATE}".* || true
+          sudo rm -f /mnt/win11.iso /mnt/unattend.iso 2>/dev/null || true
+
+      - name: Tailscale cleanup
+        if: always()
+        continue-on-error: true
+        run: |
+          sudo tailscale logout || true
+
+      - name: Trigger next machine (loop)
+        if: ${{ always() && !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          if [ ! -f "/mnt/${VM}-ready" ]; then
+            if [ "${{ job.status }}" = "failure" ]; then
+              echo "::warning title=Boot failed::Retrying automatically in 10 minutes."
+              sleep 600
+              LINK="${DOWNLOAD_LINK:-release:${TAG}}"
+              gh workflow run "Windows 11 Staging" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" \
+                -f "vm_name=${VM}" -f "action=boot" -f "source_url=$LINK" \
+                -f "runtime=${RUNTIME}" -f "vnc_password=${VNC_PASSWORD}" || true
+              exit 0
+            fi
+            echo "::warning title=Auto-loop stopped::Windows did not come up, so no successor was dispatched."
+            exit 0
+          fi
+          LINK="${DOWNLOAD_LINK:-release:${TAG}}"
+          echo "Auto-loop: dispatching Windows 11 (source=$LINK)"
+          gh workflow run "Windows 11 Staging" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" \
+            -f "vm_name=${VM}" \
+            -f "action=boot" \
+            -f "source_url=$LINK" \
+            -f "runtime=${RUNTIME}" \
+            -f "vnc_password=${VNC_PASSWORD}" 2>&1 | tee dispatch.log
+          if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+            echo "::notice title=Auto-loop::Next Windows 11 run queued."
+          else
+            echo "::warning title=Auto-loop failed::Could not dispatch the next run."
+          fi
