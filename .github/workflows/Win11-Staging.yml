@@ -46,7 +46,7 @@ env:
   SOURCE_URL: ${{ github.event.inputs.source_url || '' }}
   RUNTIME: ${{ github.event.inputs.runtime || '300' }}
   VNC_PASSWORD: ${{ github.event.inputs.vnc_password || 'runner' }}
-  TAG: state-${{ github.event.inputs.vm_name || 'win11test' }}
+  TAG: state-win11test
   WIN11_ISO_URL: "https://computernewb.com/isos/windows/en-us_windows_11_iot_enterprise_ltsc_2024_x64_dvd_f6b14814.iso"
   WIN11_ISO_SIZE: "5144817664"
   VPS_TUNNEL_HOST: "129.151.173.224"
@@ -217,7 +217,7 @@ jobs:
             ssh -N -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
               -o ExitOnForwardFailure=yes -i /tmp/vps_tunnel \
-              -R 0.0.0.0:${RDP_PORT}:localhost:${RDP_PORT} \
+              -R 0.0.0.0:${RDP_PORT}:localhost:3389 \
               -R 0.0.0.0:${VNC_PORT}:localhost:5900 \
               opc@${VPS_TUNNEL_HOST}
             sleep 5
